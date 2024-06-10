@@ -1,0 +1,425 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "This CloudFormation template sets up a Moodle application infrastructure including ECS FARGATE Container, ALB with target group, and Security groups."
+
+Parameters:
+  Region:
+    Type: String
+    Default: "us-gov-west-1"
+  VpcId:
+    Description: VPC ID
+    Type: AWS::EC2::VPC::Id
+    Default: "vpc-001022f8c38d5951d"
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues:
+    - "dev"
+    - "test"
+    - "stage"
+    - "prod"
+  ImageARN:
+    Description: The ARN of Moodle docker image
+    Type: String
+    Default: 377811118847.dkr.ecr.us-gov-west-1.amazonaws.com/moodle-ecs:4.3.3.0
+  DBInstanceClass:
+    Description: RDS instance type
+    Type: String
+    Default: "db.t2.micro"
+    AllowedValues:
+      - "db.t2.micro"
+      - "db.t2.small"
+      - "db.t3.medium"
+    ConstraintDescription: "Must be a valid RDS instance class"
+  NumberOfSubnets:
+    Description: Number of subnets. This must match your selections in the list of subnets below.
+    Type: String
+    Default: 2
+    AllowedValues:
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+  Subnet:
+    Description: Select existing subnets. The number selected must match the number of subnets above. Subnets selected must be in separate AZs.
+    Type: List<AWS::EC2::Subnet::Id>
+  ECRRepositoryName:
+    Type: String
+    Description: "ECR Repository Name for Moodle Docker images"
+  pPublicURL:
+    Description: The FQDN used to access the web sites
+    Type: String
+    Default: "learn.lab.cce.af.mil"
+
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: The subnet where to launch the service
+    Default: subnet-ID
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: The subnet where to Launch the service
+    Default: subnet-ID
+  PerformanceMode:
+    Type: String
+    Default: generalPurpose
+    AllowedValues:
+    - generalPurpose
+    - maxIO
+
+Mappings:
+  Stack:
+    dev:
+      DMZASubnet: subnet-01b73506699ba1592
+      DMZBSubnet: subnet-0ada3fa4063f8222e
+      DbSubnetA: subnet-0a6b7e44f252af04f
+      DbSubnetB: subnet-07469065b32c8e25fs
+      CidrBlock: 10.150.0.0/16
+
+Resources:
+# Creating the Security Groups for Moodle App Infrastructure
+# Security Group for ECS Container
+  MoodleSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Securitygroup for RDS Database"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "tcp"
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+
+# Security Group for Load Balancers
+  LBSecurityGroup1:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Securitygroup-1 for Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: "10.150.0.0/16"
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0" 
+
+  moodleLogGroup: 
+     Type: AWS::Logs::LogGroup
+     Properties: 
+       RetentionInDays: 7
+
+  ElasticCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Moodle Application Elastic Cache Subnet Group
+      SubnetIds: 
+        - !Ref Subnet1
+        - !Ref Subnet2
+      Tags: 
+        - Key: Name 
+          Value: DLSA-myLearning-Lab-Moodle-Subnet-Group
+
+  ElasticCacheCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      AutoMinorVersionUpgrade: true
+      CacheNodeType: cache.t3.medium
+      CacheSubnetGroupName: !Ref ElasticCacheSubnetGroup
+      Engine: Redis
+      EngineVersion: 6.0
+      IpDiscovery: ipv4
+      NetworkType: ipv4
+      NumCacheNodes: 1
+      Port: 6379
+      PreferredMaintenanceWindow: fri:22:00-fri:23:00
+      TransitEncryptionEnabled: false
+      VpcSecurityGroupIds: 
+        - !Ref MoodleSecurityGroup
+
+  ElasticCacheReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    DependsOn: ElasticCacheCluster
+    Properties:
+      AutoMinorVersionUpgrade: true
+      AtRestEncryptionEnabled: true
+      AutomaticFailoverEnabled: true
+      ClusterMode: disabled  # Disabled to use multi-node replication
+      MultiAZEnabled: true
+      CacheNodeType: cache.t3.medium
+      CacheSubnetGroupName: !Ref ElasticCacheSubnetGroup
+      Engine: Redis
+      EngineVersion: 6.0
+      IpDiscovery: ipv4
+      NetworkType: ipv4
+      ReplicationGroupDescription: moodlecluster-replicas.on  # Provide a description for the replication group
+      NumNodeGroups: 1  # Ensure there are at least 2 node groups
+      ReplicasPerNodeGroup: 1
+      ##ReplicasPerNodeGroup: 1  # Set replicas per node group to 1
+      PreferredCacheClusterAZs: 
+        - us-gov-west-1a
+        - us-gov-west-1b
+      Port: 6379
+      PreferredMaintenanceWindow: fri:22:00-fri:23:00
+      TransitEncryptionEnabled: false
+      SecurityGroupIds: 
+        - !Ref MoodleSecurityGroup
+
+# Creating the ECS Cluster     
+  ECSCluster: 
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: "DLSA-myLearning-Lab-Moodle-Cluster"
+      ClusterSettings:
+        - Name: "containerInsights"
+          Value: "enabled"
+
+# Creating the ECS Task Definition for Moodle Application
+  ECSTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      Family: "DLSA-myLearning-Lab-Moodle-Task"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: "2048"
+      Memory: "4096"
+      ExecutionRoleArn: "arn:aws-us-gov:iam::377811118847:role/aws-ecs-execution-role"
+      TaskRoleArn: "arn:aws-us-gov:iam::377811118847:role/aws-ecs-execution-role"
+      ContainerDefinitions:
+        - Name: "DLSA-myLearning-Lab-Moodle-Container"
+          Image: !Ref ImageARN 
+          Environment:
+          - Name: "DBUSER"
+            Value: "dbadmin"
+          - Name: "DBHOST"
+            Value: "dlsa-mylearning.cluster-ccvypq6fxz9f.us-gov-west-1.rds.amazonaws.com"
+          - Name: "DBPASSWORD"
+            Value: "t0EJVLlwTyuLgw4mlRNo"
+          - Name: "SAMLENABLED"
+            Value: "true"
+          - Name: "SAMLKEYSTOREPASSWORD"
+            Value: "rK95N#jw96_1"
+          - Name: "SAMLPRIVATEKEYPASSWORD"
+            Value: "rK95N#jw96_1"
+          - Name: "DBREADONLYHOST"
+            Value: "true"
+          - Name: "SITEURL"
+            Value: "learn.lab.cce.af.mil"
+          - Name: "DBTYPE"
+            Value: "auroramysql"
+          - Name: "REDISHOST"
+            Value: "moo-el-1uuqlaoanx0dn.wo5uei.0001.usgw1.cache.amazonaws.com"
+          MountPoints:
+            - SourceVolume: efs-volume
+              ContainerPath: /mnt/moodledata    
+          Essential: true
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Ref moodleLogGroup 
+              awslogs-region: !Ref Region 
+              awslogs-stream-prefix: "ecs"
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+      Volumes:
+        - Name: efs-volume
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            RootDirectory: /
+            TransitEncryption: ENABLED
+
+# Creating the ECS Service for Moodle Application
+  ECSService:
+    Type: "AWS::ECS::Service"
+    DependsOn: moodleTargetGroup
+    DependsOn:
+      - httpsAlbListener
+      - httpAlbListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      LaunchType: "FARGATE"
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 2  # You can adjust the desired count based on your needs
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 70
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref Subnet
+          SecurityGroups: [!Ref MoodleSecurityGroup]
+      LoadBalancers:
+        - ContainerName: "DLSA-myLearning-Lab-Moodle-Container"
+          ContainerPort: 80
+          TargetGroupArn: !Ref moodleTargetGroup
+      EnableExecuteCommand: true  #Enable SSM login via cloudshell script
+# Creating the Application Load Balancer for Moodle Application
+  LoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: "DLSA-myL-Lab-Moodle-ALB"
+      Scheme: "internet-facing"
+      Type: "application"
+      Subnets:
+        - !FindInMap [ 
+          Stack,
+          !Ref Environment,
+          DMZASubnet,
+        ]
+        - !FindInMap [
+          Stack,
+          !Ref Environment,
+          DMZBSubnet,
+        ]
+      SecurityGroups:
+        - !Ref LBSecurityGroup1 
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: "deletion_protection.enabled"
+          Value: "false"
+        - Key: "routing.http2.enabled"
+          Value: "true"
+        - Key: "routing.http.drop_invalid_header_fields.enabled"
+          Value: "false"
+        - Key: "access_logs.s3.enabled"
+          Value: "false"
+        - Key: "routing.http.desync_mitigation_mode"
+          Value: "defensive"
+        - Key: "load_balancing.cross_zone.enabled"
+          Value: "true"
+        - Key: "routing.http.xff_header_processing.mode"
+          Value: "append"  
+
+# Create the Listener for the ALB Load Balancer
+  httpsAlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: "arn:aws-us-gov:iam::377811118847:server-certificate/learn.lab.cce.af.mil"
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref moodleTargetGroup
+      LoadBalancerArn:
+        Ref: LoadBalancer
+      Port: 443
+      Protocol: "HTTPS"
+      SslPolicy: "ELBSecurityPolicy-FS-1-2-Res-2020-10"
+
+  httpAlbListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref moodleTargetGroup
+      LoadBalancerArn:
+        Ref: LoadBalancer
+      Port: 80
+      Protocol: "HTTP"         
+
+# Creating the Target Group for Moodle Application Load Balancer
+  moodleTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: "/elb-status"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: "HTTP"
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      Name: "DLSA-myLearning-Lab-Moodle-TG"
+      Port: 80
+      Protocol: "HTTP"
+      TargetType: ip
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VpcId
+
+# Creating the EFS FileSystem for Moodle Application 
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      BackupPolicy:
+        Status: ENABLED
+      Encrypted: true
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+        - TransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      PerformanceMode: !Ref PerformanceMode
+      Encrypted: true
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: "Name"
+          Value: "DLSA-myLearning-Lab-Moodle-EFS"
+
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref EFSFileSystem
+      SecurityGroups: 
+        - !Ref EFSSecurityGroup
+      SubnetId: !Ref Subnet1
+
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref EFSFileSystem
+      SecurityGroups: 
+        - !Ref EFSSecurityGroup
+      SubnetId: !Ref Subnet2
+
+  EFSSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "security group for the prod EFS"
+      GroupName: "DLSA-myLearning-Lab-Moodle-EFS-SG"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: 
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "tcp"
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref MoodleSecurityGroup   
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+
+# Outputs values of our CloudFormation Template
+Outputs:
+  LoadBalancerDNS:
+    Value: !GetAtt LoadBalancer.DNSName
